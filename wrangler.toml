@@ -1,0 +1,14 @@
+name = "gs-maintenance-page"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+# KV Namespace binding for storing maintenance configuration persistently
+# Uncomment and set your binding id after running: `npx wrangler kv:namespace create MAINTENANCE_KV`
+[[kv_namespaces]]
+binding = "MAINTENANCE_KV"
+id = "YOUR_KV_NAMESPACE_ID"
+# preview_id = "YOUR_PREVIEW_KV_NAMESPACE_ID"
+
+[vars]
+# Default admin key if env secret is not set (Production recommended: `npx wrangler secret put ADMIN_KEY`)
+DEFAULT_ADMIN_KEY = "gamess2026!"

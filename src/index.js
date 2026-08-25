@@ -212,9 +212,10 @@ export default {
     if (path === '/api/admin/login' && request.method === 'POST') {
       try {
         const body = await request.json();
-        const adminSecret = (env && env.ADMIN_KEY) || (env && env.DEFAULT_ADMIN_KEY) || 'gamess2026!';
+        const inputPassword = String(body.password || '').trim();
+        const adminSecret = String((env && env.ADMIN_KEY) || (env && env.DEFAULT_ADMIN_KEY) || 'gamess2026!').trim();
         
-        if (body.password === adminSecret) {
+        if (inputPassword === adminSecret) {
           const sessionToken = btoa(adminSecret);
           const isSecure = url.protocol === 'https:';
           const cookieHeader = `gs_admin_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400${isSecure ? '; Secure' : ''}`;
@@ -1164,7 +1165,7 @@ function renderAdminHtml(config, isAuthenticated) {
     if (loginForm) {
       loginForm.addEventListener('submit', async (e) => {
         e.preventDefault();
-        const password = document.getElementById('adminPass').value;
+        const password = document.getElementById('adminPass').value.trim();
         try {
           const res = await fetch('/api/admin/login', {
             method: 'POST',
@@ -1173,10 +1174,10 @@ function renderAdminHtml(config, isAuthenticated) {
           });
           const data = await res.json();
           if (data.success) {
-            showToast('로그인 되었습니다.', true);
-            setTimeout(() => location.reload(), 800);
+            showToast('로그인 성공! 이동 중...', true);
+            setTimeout(() => { window.location.href = '/admin'; }, 400);
           } else {
-            showToast(data.message || '로그인 실패', false);
+            showToast(data.message || '비밀번호가 올바르지 않습니다.', false);
           }
         } catch (err) {
           showToast('통신 오류가 발생했습니다.', false);

@@ -160,7 +160,10 @@ async function checkServicesHealth() {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    const path = url.pathname;
+    let path = url.pathname;
+    if (path.length > 1 && path.endsWith('/')) {
+      path = path.slice(0, -1);
+    }
 
     // Route 1: Raw Logo Endpoint (Visible even if origin server is down)
     if (path === '/logo.png') {

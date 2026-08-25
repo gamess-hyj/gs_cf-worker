@@ -1,13 +1,13 @@
-name = "gs-maintenance-page"
+name = "worker"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
 
 # KV Namespace binding for storing maintenance configuration persistently
-# Uncomment and set your binding id after running: `npx wrangler kv:namespace create MAINTENANCE_KV`
-[[kv_namespaces]]
-binding = "MAINTENANCE_KV"
-id = "YOUR_KV_NAMESPACE_ID"
-# preview_id = "YOUR_PREVIEW_KV_NAMESPACE_ID"
+# KV 생성 후 아래 주석을 해제하고 실제 ID로 변경하세요:
+# `npx wrangler kv:namespace create MAINTENANCE_KV`
+# [[kv_namespaces]]
+# binding = "MAINTENANCE_KV"
+# id = "YOUR_ACTUAL_KV_NAMESPACE_ID"
 
 [vars]
 # Default admin key if env secret is not set (Production recommended: `npx wrangler secret put ADMIN_KEY`)

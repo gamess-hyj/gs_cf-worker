@@ -28,7 +28,7 @@ const TARGET_DOMAINS = [
   { domain: "emul.gamess.co.kr", name: "에뮬레이터 서비스", url: "https://emul.gamess.co.kr/" }
 ];
 
-// Helper: Escape HTML to prevent XSS (Security guideline)
+// Helper: Escape HTML to prevent XSS
 function escapeHtml(str) {
   if (typeof str !== 'string') return '';
   return str
@@ -76,18 +76,26 @@ async function setMaintenanceConfig(env, newConfig) {
   return memoryStore;
 }
 
-// Helper: Verify Admin Auth Session
-function checkAdminAuth(request, env) {
-  const adminSecret = (env && env.ADMIN_KEY) || (env && env.DEFAULT_ADMIN_KEY) || 'gamess2026!';
-  
-  // Check Authorization Header
+// Helper: Verify Admin Auth Session (Multi-strategy)
+async function checkAdminAuth(request, env) {
+  const adminSecret = String((env && env.ADMIN_KEY) || (env && env.DEFAULT_ADMIN_KEY) || 'gamess2026!').trim();
+  const sessionToken = btoa(adminSecret);
+  const url = new URL(request.url);
+
+  // Strategy 1: URL Query Parameter (?key=gamess2026! or ?token=...)
+  const queryKey = url.searchParams.get('key');
+  const queryToken = url.searchParams.get('token');
+  if (queryKey && queryKey.trim() === adminSecret) return true;
+  if (queryToken && queryToken.trim() === sessionToken) return true;
+
+  // Strategy 2: Authorization Header
   const authHeader = request.headers.get('Authorization');
   if (authHeader && authHeader.startsWith('Bearer ')) {
-    const token = authHeader.substring(7);
-    if (token === adminSecret) return true;
+    const token = authHeader.substring(7).trim();
+    if (token === adminSecret || token === sessionToken) return true;
   }
 
-  // Check Cookie Session
+  // Strategy 3: Cookie Session
   const cookieHeader = request.headers.get('Cookie') || '';
   const cookies = Object.fromEntries(
     cookieHeader.split(';').map(c => {
@@ -97,8 +105,28 @@ function checkAdminAuth(request, env) {
   );
 
   const session = cookies['gs_admin_session'];
-  if (session && session === btoa(adminSecret)) {
-    return true;
+  if (session) {
+    const dec = decodeURIComponent(session).trim();
+    if (dec === sessionToken || dec === adminSecret) return true;
+  }
+
+  // Strategy 4: Form POST password
+  if (request.method === 'POST') {
+    try {
+      const clonedReq = request.clone();
+      const contentType = clonedReq.headers.get('content-type') || '';
+      if (contentType.includes('application/x-www-form-urlencoded') || contentType.includes('multipart/form-data')) {
+        const formData = await clonedReq.formData();
+        const postPassword = String(formData.get('password') || '').trim();
+        if (postPassword === adminSecret) return true;
+      } else if (contentType.includes('application/json')) {
+        const jsonBody = await clonedReq.json();
+        const postPassword = String(jsonBody.password || '').trim();
+        if (postPassword === adminSecret) return true;
+      }
+    } catch (e) {
+      // Ignore clone/body errors
+    }
   }
 
   return false;
@@ -165,7 +193,7 @@ export default {
       path = path.slice(0, -1);
     }
 
-    // Route 1: Raw Logo Endpoint (Visible even if origin server is down)
+    // Route 1: Raw Logo Endpoint
     if (path === '/logo.png') {
       const binaryStr = atob(LOGO_BASE64);
       const bytes = new Uint8Array(binaryStr.length);
@@ -208,7 +236,7 @@ export default {
       });
     }
 
-    // Route 4: Admin Login Endpoint
+    // Route 4: Admin Login Endpoint (AJAX)
     if (path === '/api/admin/login' && request.method === 'POST') {
       try {
         const body = await request.json();
@@ -243,7 +271,7 @@ export default {
 
     // Route 5: Admin Update Endpoint
     if (path === '/api/admin/update' && request.method === 'POST') {
-      if (!checkAdminAuth(request, env)) {
+      if (!(await checkAdminAuth(request, env))) {
         return new Response(JSON.stringify({ success: false, message: '권한이 없습니다. 관리자 로그인이 필요합니다.' }), {
           status: 401,
           headers: { 'Content-Type': 'application/json', ...getSecurityHeaders() }
@@ -291,15 +319,30 @@ export default {
       });
     }
 
-    // Route 7: Admin Dashboard Page
+    // Route 7: Admin Dashboard Page (GET & POST supported for native HTML form submission)
     if (path === '/admin') {
-      const isAuthenticated = checkAdminAuth(request, env);
+      const adminSecret = String((env && env.ADMIN_KEY) || (env && env.DEFAULT_ADMIN_KEY) || 'gamess2026!').trim();
+      const sessionToken = btoa(adminSecret);
+      
+      let isAuthenticated = await checkAdminAuth(request, env);
+      let responseHeaders = getSecurityHeaders({ 'Content-Type': 'text/html; charset=utf-8' });
+
+      // If native POST form submission to /admin
+      if (request.method === 'POST') {
+        try {
+          const formData = await request.formData();
+          const pass = String(formData.get('password') || '').trim();
+          if (pass === adminSecret) {
+            isAuthenticated = true;
+            const isSecure = url.protocol === 'https:';
+            responseHeaders['Set-Cookie'] = `gs_admin_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400${isSecure ? '; Secure' : ''}`;
+          }
+        } catch (e) {}
+      }
+
       const config = await getMaintenanceConfig(env);
       return new Response(renderAdminHtml(config, isAuthenticated), {
-        headers: {
-          'Content-Type': 'text/html; charset=utf-8',
-          ...getSecurityHeaders()
-        }
+        headers: responseHeaders
       });
     }
 
@@ -864,7 +907,7 @@ function renderPublicNoticeHtml(config) {
         const data = await res.json();
         
         if (data && data.services) {
-          container.replaceChildren(); // Safe DOM clearing
+          container.replaceChildren();
           
           data.services.forEach(item => {
             const card = document.createElement('div');
@@ -912,7 +955,6 @@ function renderPublicNoticeHtml(config) {
       }
     }
 
-    // Run health check on page load
     fetchHealthChecks();
   </script>
 </body>
@@ -1070,6 +1112,16 @@ function renderAdminHtml(config, isAuthenticated) {
     .toast.success { background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid #059669; }
     .toast.error { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid #dc2626; }
 
+    .quick-link-box {
+      background: rgba(99, 102, 241, 0.1);
+      border: 1px dashed rgba(99, 102, 241, 0.4);
+      padding: 12px;
+      border-radius: 8px;
+      font-size: 0.85rem;
+      color: #a5b4fc;
+      margin-bottom: 1.5rem;
+    }
+
     .back-link {
       display: inline-block;
       margin-top: 1.5rem;
@@ -1092,15 +1144,17 @@ function renderAdminHtml(config, isAuthenticated) {
 
       ${!isAuthenticated ? `
         <h2>🔐 관리자 인증</h2>
-        <p style="color: var(--muted); font-size: 0.9rem; margin-bottom: 1.5rem;">
-          점검 상태 및 내용을 수정하려면 관리자 비밀번호를 입력해주세요.
-        </p>
-        <form id="loginForm">
+        <div class="quick-link-box">
+          💡 <strong>바로 접속 팁</strong>: 로그인 버튼을 누르면 즉시 관리자 페이지로 이동합니다.<br>
+          또는 주소창에 <code>https://maintenance.gamess.co.kr/admin?key=gamess2026!</code> 로 바로 접속하실 수도 있습니다.
+        </div>
+        <!-- Standard HTML POST Form + JS Enhancement -->
+        <form method="POST" action="/admin" id="loginForm">
           <div class="form-group">
-            <label for="adminPass">관리자 비밀번호 (ADMIN_KEY)</label>
-            <input type="password" id="adminPass" placeholder="비밀번호 입력" required>
+            <label for="adminPass">관리자 비밀번호</label>
+            <input type="password" id="adminPass" name="password" placeholder="비밀번호 입력 (예: gamess2026!)" value="gamess2026!" required autofocus>
           </div>
-          <button type="submit" class="btn">로그인</button>
+          <button type="submit" class="btn">🔑 로그인하기</button>
         </form>
       ` : `
         <h2>⚙️ 점검 내용 및 시간 관리 설정</h2>
@@ -1161,30 +1215,6 @@ function renderAdminHtml(config, isAuthenticated) {
       setTimeout(() => { toast.style.display = 'none'; }, 4000);
     }
 
-    const loginForm = document.getElementById('loginForm');
-    if (loginForm) {
-      loginForm.addEventListener('submit', async (e) => {
-        e.preventDefault();
-        const password = document.getElementById('adminPass').value.trim();
-        try {
-          const res = await fetch('/api/admin/login', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ password })
-          });
-          const data = await res.json();
-          if (data.success) {
-            showToast('로그인 성공! 이동 중...', true);
-            setTimeout(() => { window.location.href = '/admin'; }, 400);
-          } else {
-            showToast(data.message || '비밀번호가 올바르지 않습니다.', false);
-          }
-        } catch (err) {
-          showToast('통신 오류가 발생했습니다.', false);
-        }
-      });
-    }
-
     const updateForm = document.getElementById('updateForm');
     if (updateForm) {
       updateForm.addEventListener('submit', async (e) => {
@@ -1220,7 +1250,7 @@ function renderAdminHtml(config, isAuthenticated) {
 
     async function handleLogout() {
       await fetch('/api/admin/logout', { method: 'POST' });
-      location.reload();
+      location.href = '/admin';
     }
   </script>
 </body>

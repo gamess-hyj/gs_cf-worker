@@ -52,28 +52,33 @@ function getSecurityHeaders(extraHeaders = {}) {
 
 // Helper: Read maintenance config from KV or memory fallback
 async function getMaintenanceConfig(env) {
+  let config = { ...memoryStore };
   if (env && env.MAINTENANCE_KV) {
     try {
       const data = await env.MAINTENANCE_KV.get('config', { type: 'json' });
-      if (data) return data;
+      if (data && typeof data === 'object') {
+        config = { ...memoryStore, ...data };
+      }
     } catch (e) {
       console.error('KV Read Error:', e);
     }
   }
-  return memoryStore;
+  return config;
 }
 
 // Helper: Save maintenance config to KV and memory fallback
 async function setMaintenanceConfig(env, newConfig) {
-  memoryStore = { ...memoryStore, ...newConfig };
+  const current = await getMaintenanceConfig(env);
+  const updated = { ...current, ...newConfig };
+  memoryStore = updated;
   if (env && env.MAINTENANCE_KV) {
     try {
-      await env.MAINTENANCE_KV.put('config', JSON.stringify(memoryStore));
+      await env.MAINTENANCE_KV.put('config', JSON.stringify(updated));
     } catch (e) {
       console.error('KV Write Error:', e);
     }
   }
-  return memoryStore;
+  return updated;
 }
 
 // Helper: Verify Admin Auth Session (Multi-strategy)
@@ -82,8 +87,8 @@ async function checkAdminAuth(request, env) {
   const sessionToken = btoa(adminSecret);
   const url = new URL(request.url);
 
-  // Strategy 1: URL Query Parameter (?key=gamess2026! or ?token=...)
-  const queryKey = url.searchParams.get('key');
+  // Strategy 1: URL Query Parameter (?key=gamess2026! or ?token=... or ?adminKey=...)
+  const queryKey = url.searchParams.get('key') || url.searchParams.get('adminKey');
   const queryToken = url.searchParams.get('token');
   if (queryKey && queryKey.trim() === adminSecret) return true;
   if (queryToken && queryToken.trim() === sessionToken) return true;
@@ -95,7 +100,11 @@ async function checkAdminAuth(request, env) {
     if (token === adminSecret || token === sessionToken) return true;
   }
 
-  // Strategy 3: Cookie Session
+  // Strategy 3: Custom Headers (X-Admin-Key or X-Admin-Token)
+  const customKey = request.headers.get('X-Admin-Key') || request.headers.get('X-Admin-Token');
+  if (customKey && (customKey.trim() === adminSecret || customKey.trim() === sessionToken)) return true;
+
+  // Strategy 4: Cookie Session
   const cookieHeader = request.headers.get('Cookie') || '';
   const cookies = Object.fromEntries(
     cookieHeader.split(';').map(c => {
@@ -110,19 +119,31 @@ async function checkAdminAuth(request, env) {
     if (dec === sessionToken || dec === adminSecret) return true;
   }
 
-  // Strategy 4: Form POST password
+  // Strategy 5: Referer header (?key=...)
+  const referer = request.headers.get('Referer');
+  if (referer) {
+    try {
+      const refUrl = new URL(referer);
+      const refKey = refUrl.searchParams.get('key') || refUrl.searchParams.get('adminKey');
+      const refToken = refUrl.searchParams.get('token');
+      if (refKey && refKey.trim() === adminSecret) return true;
+      if (refToken && refToken.trim() === sessionToken) return true;
+    } catch (e) {}
+  }
+
+  // Strategy 6: Form POST password or JSON body key
   if (request.method === 'POST') {
     try {
       const clonedReq = request.clone();
       const contentType = clonedReq.headers.get('content-type') || '';
       if (contentType.includes('application/x-www-form-urlencoded') || contentType.includes('multipart/form-data')) {
         const formData = await clonedReq.formData();
-        const postPassword = String(formData.get('password') || '').trim();
-        if (postPassword === adminSecret) return true;
+        const postPassword = String(formData.get('password') || formData.get('key') || formData.get('admin_key') || '').trim();
+        if (postPassword === adminSecret || postPassword === sessionToken) return true;
       } else if (contentType.includes('application/json')) {
         const jsonBody = await clonedReq.json();
-        const postPassword = String(jsonBody.password || '').trim();
-        if (postPassword === adminSecret) return true;
+        const postPassword = String(jsonBody.password || jsonBody.key || jsonBody.adminKey || '').trim();
+        if (postPassword === adminSecret || postPassword === sessionToken) return true;
       }
     } catch (e) {
       // Ignore clone/body errors
@@ -207,6 +228,82 @@ export default {
           ...getSecurityHeaders()
         }
       });
+    }
+
+    // Route 1.5: On-the-fly Media Edge Optimization & Caching (/img-edge)
+    if (path === '/img-edge' || path === '/media-proxy') {
+      const srcUrl = url.searchParams.get('url');
+      if (!srcUrl) {
+        return new Response(JSON.stringify({ error: 'Missing image url parameter (?url=...)' }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json', ...getSecurityHeaders() }
+        });
+      }
+
+      // 허용된 원본 도메인 검증 (SSRF 방지)
+      try {
+        const parsedSrc = new URL(srcUrl, 'https://storage.gamess.co.kr');
+        const allowedHosts = ['storage.gamess.co.kr', 'www.gamess.co.kr', 'gamess.co.kr', 'wiki.gamess.co.kr', 'emul.gamess.co.kr'];
+        if (!allowedHosts.includes(parsedSrc.hostname)) {
+          return new Response(JSON.stringify({ error: 'Forbidden origin host' }), {
+            status: 403,
+            headers: { 'Content-Type': 'application/json', ...getSecurityHeaders() }
+          });
+        }
+
+        // Cloudflare Cache API 조회 (캐시 히트 시 초고속 반환)
+        const cache = caches.default;
+        const cacheKey = new Request(request.url, request);
+        let cachedResponse = await cache.match(cacheKey);
+        if (cachedResponse) {
+          return cachedResponse;
+        }
+
+        // 원본 이미지 페치 (Cloudflare Image Resizing 지원 환경 자동 활용)
+        const width = parseInt(url.searchParams.get('w') || '0', 10);
+        const quality = parseInt(url.searchParams.get('q') || '85', 10);
+        const fetchOpts = {
+          headers: {
+            'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+            'User-Agent': 'Gamess-Edge-Worker/2.0'
+          }
+        };
+
+        if (width > 0 && request.cf) {
+          fetchOpts.cf = {
+            image: {
+              width: width,
+              quality: quality,
+              format: 'auto'
+            }
+          };
+        }
+
+        const imgRes = await fetch(parsedSrc.toString(), fetchOpts);
+        if (!imgRes.ok) {
+          return new Response('Failed to fetch origin media', { status: imgRes.status });
+        }
+
+        // 엣지 캐싱 헤더 적용 (브라우저 7일, CDN 30일 캐시)
+        const newHeaders = new Headers(imgRes.headers);
+        newHeaders.set('Cache-Control', 'public, max-age=604800, s-maxage=2592000, immutable');
+        newHeaders.set('Access-Control-Allow-Origin', '*');
+        newHeaders.set('X-Edge-Optimized', 'true');
+
+        const responseToCache = new Response(imgRes.body, {
+          status: imgRes.status,
+          headers: newHeaders
+        });
+
+        // 백그라운드 엣지 캐시 저장
+        ctx.waitUntil(cache.put(cacheKey, responseToCache.clone()));
+        return responseToCache;
+      } catch (err) {
+        return new Response(JSON.stringify({ error: 'Invalid URL or fetch failed', detail: err.message }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
     }
 
     // Route 2: Public Status API
@@ -326,22 +423,47 @@ export default {
       
       let isAuthenticated = await checkAdminAuth(request, env);
       let responseHeaders = getSecurityHeaders({ 'Content-Type': 'text/html; charset=utf-8' });
+      let toastInfo = null;
 
       // If native POST form submission to /admin
       if (request.method === 'POST') {
         try {
           const formData = await request.formData();
-          const pass = String(formData.get('password') || '').trim();
-          if (pass === adminSecret) {
+          const action = String(formData.get('action') || '').trim();
+          const pass = String(formData.get('password') || formData.get('key') || formData.get('admin_key') || '').trim();
+          
+          if (pass === adminSecret || isAuthenticated) {
             isAuthenticated = true;
             const isSecure = url.protocol === 'https:';
             responseHeaders['Set-Cookie'] = `gs_admin_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400${isSecure ? '; Secure' : ''}`;
+            
+            if (action === 'update' || formData.has('title')) {
+              const updatedConfig = {
+                enabled: true,
+                status: ['ongoing', 'scheduled', 'completed'].includes(formData.get('status')) ? formData.get('status') : 'ongoing',
+                title: String(formData.get('title') || '게임세상 서비스 정기 점검 안내'),
+                startTime: String(formData.get('startTime') || ''),
+                endTime: String(formData.get('endTime') || ''),
+                noticeText: String(formData.get('noticeText') || ''),
+                impactedServices: String(formData.get('impactedServices') || '').split('\n').map(s => s.trim()).filter(Boolean),
+                contactInfo: String(formData.get('contactInfo') || 'support@gamess.co.kr')
+              };
+              await setMaintenanceConfig(env, updatedConfig);
+              toastInfo = { message: '점검 설정이 성공적으로 저장되었습니다.', isSuccess: true };
+            }
           }
-        } catch (e) {}
+        } catch (e) {
+          toastInfo = { message: '저장 중 오류 발생: ' + e.message, isSuccess: false };
+        }
+      }
+
+      if (isAuthenticated) {
+        const isSecure = url.protocol === 'https:';
+        responseHeaders['Set-Cookie'] = `gs_admin_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400${isSecure ? '; Secure' : ''}`;
       }
 
       const config = await getMaintenanceConfig(env);
-      return new Response(renderAdminHtml(config, isAuthenticated), {
+      return new Response(renderAdminHtml(config, isAuthenticated, adminSecret, toastInfo), {
         headers: responseHeaders
       });
     }
@@ -964,7 +1086,7 @@ function renderPublicNoticeHtml(config) {
 /**
  * Admin Management Dashboard HTML Renderer
  */
-function renderAdminHtml(config, isAuthenticated) {
+function renderAdminHtml(config, isAuthenticated, adminSecret = 'gamess2026!', toastInfo = null) {
   const logoDataUri = `data:image/png;base64,${LOGO_BASE64}`;
 
   return `<!DOCTYPE html>
@@ -1158,10 +1280,13 @@ function renderAdminHtml(config, isAuthenticated) {
         </form>
       ` : `
         <h2>⚙️ 점검 내용 및 시간 관리 설정</h2>
-        <form id="updateForm">
+        <form method="POST" action="/admin" id="updateForm">
+          <input type="hidden" name="action" value="update">
+          <input type="hidden" name="admin_key" value="${escapeHtml(adminSecret)}">
+
           <div class="form-group">
             <label for="status">점검 진행 상태</label>
-            <select id="status">
+            <select id="status" name="status">
               <option value="ongoing" ${config.status === 'ongoing' ? 'selected' : ''}>🔴 서비스 점검 진행 중 (ongoing)</option>
               <option value="scheduled" ${config.status === 'scheduled' ? 'selected' : ''}>🟡 점검 예정 (scheduled)</option>
               <option value="completed" ${config.status === 'completed' ? 'selected' : ''}>🟢 점검 완료 / 서비스 정상 (completed)</option>
@@ -1170,33 +1295,33 @@ function renderAdminHtml(config, isAuthenticated) {
 
           <div class="form-group">
             <label for="title">점검 안내 제목</label>
-            <input type="text" id="title" value="${escapeHtml(config.title)}" required>
+            <input type="text" id="title" name="title" value="${escapeHtml(config.title)}" required>
           </div>
 
           <div class="flex-row">
             <div class="form-group" style="flex:1;">
               <label for="startTime">점검 시작 시간</label>
-              <input type="text" id="startTime" value="${escapeHtml(config.startTime)}" placeholder="예: 2026-08-25T02:00:00+09:00" required>
+              <input type="text" id="startTime" name="startTime" value="${escapeHtml(config.startTime)}" placeholder="예: 2026-08-25T02:00:00+09:00" required>
             </div>
             <div class="form-group" style="flex:1;">
               <label for="endTime">점검 종료 시간</label>
-              <input type="text" id="endTime" value="${escapeHtml(config.endTime)}" placeholder="예: 2026-08-26T08:00:00+09:00" required>
+              <input type="text" id="endTime" name="endTime" value="${escapeHtml(config.endTime)}" placeholder="예: 2026-08-26T08:00:00+09:00" required>
             </div>
           </div>
 
           <div class="form-group">
             <label for="noticeText">점검 안내 상세 설명</label>
-            <textarea id="noticeText" required>${escapeHtml(config.noticeText)}</textarea>
+            <textarea id="noticeText" name="noticeText" required>${escapeHtml(config.noticeText)}</textarea>
           </div>
 
           <div class="form-group">
             <label for="impactedServices">영향 받는 서비스 목록 (줄바꿈 구분)</label>
-            <textarea id="impactedServices" required>${escapeHtml((config.impactedServices || []).join('\n'))}</textarea>
+            <textarea id="impactedServices" name="impactedServices" required>${escapeHtml((config.impactedServices || []).join('\n'))}</textarea>
           </div>
 
           <div class="form-group">
             <label for="contactInfo">고객 지원 연락처 / 이메일</label>
-            <input type="text" id="contactInfo" value="${escapeHtml(config.contactInfo)}" required>
+            <input type="text" id="contactInfo" name="contactInfo" value="${escapeHtml(config.contactInfo)}" required>
           </div>
 
           <button type="submit" class="btn">💾 점검 설정 저장</button>
@@ -1215,10 +1340,18 @@ function renderAdminHtml(config, isAuthenticated) {
       setTimeout(() => { toast.style.display = 'none'; }, 4000);
     }
 
+    ${toastInfo ? `showToast(${JSON.stringify(toastInfo.message)}, ${Boolean(toastInfo.isSuccess)});` : ''}
+
+    const adminSecret = ${JSON.stringify(adminSecret)};
+
     const updateForm = document.getElementById('updateForm');
     if (updateForm) {
       updateForm.addEventListener('submit', async (e) => {
         e.preventDefault();
+        const searchParams = new URLSearchParams(window.location.search);
+        const urlKey = searchParams.get('key') || '';
+        const keyToSend = urlKey || adminSecret;
+
         const payload = {
           enabled: true,
           status: document.getElementById('status').value,
@@ -1226,14 +1359,27 @@ function renderAdminHtml(config, isAuthenticated) {
           startTime: document.getElementById('startTime').value,
           endTime: document.getElementById('endTime').value,
           noticeText: document.getElementById('noticeText').value,
-          impactedServices: document.getElementById('impactedServices').value.split('\n').filter(Boolean),
-          contactInfo: document.getElementById('contactInfo').value
+          impactedServices: document.getElementById('impactedServices').value.split('\n').map(s => s.trim()).filter(Boolean),
+          contactInfo: document.getElementById('contactInfo').value,
+          key: keyToSend
         };
 
+        const submitBtn = updateForm.querySelector('button[type="submit"]');
+        if (submitBtn) {
+          submitBtn.disabled = true;
+          submitBtn.textContent = '⏳ 저장 중...';
+        }
+
         try {
-          const res = await fetch('/api/admin/update', {
+          const updateUrl = keyToSend ? '/api/admin/update?key=' + encodeURIComponent(keyToSend) : '/api/admin/update';
+          const res = await fetch(updateUrl, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer ' + keyToSend,
+              'X-Admin-Key': keyToSend
+            },
             body: JSON.stringify(payload)
           });
           const data = await res.json();
@@ -1243,13 +1389,44 @@ function renderAdminHtml(config, isAuthenticated) {
             showToast(data.message || '저장 실패', false);
           }
         } catch (err) {
-          showToast('설정 저장 중 오류가 발생했습니다.', false);
+          showToast('설정 저장 중 오류가 발생했습니다: ' + err.message, false);
+        } finally {
+          if (submitBtn) {
+            submitBtn.disabled = false;
+            submitBtn.textContent = '💾 점검 설정 저장';
+          }
+        }
+      });
+    }
+
+    const loginForm = document.getElementById('loginForm');
+    if (loginForm) {
+      loginForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const password = document.getElementById('adminPass').value;
+        try {
+          const res = await fetch('/api/admin/login', {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ password })
+          });
+          const data = await res.json();
+          if (data.success) {
+            location.href = '/admin?key=' + encodeURIComponent(password);
+          } else {
+            showToast(data.message || '비밀번호가 일치하지 않습니다.', false);
+          }
+        } catch (err) {
+          loginForm.submit();
         }
       });
     }
 
     async function handleLogout() {
-      await fetch('/api/admin/logout', { method: 'POST' });
+      try {
+        await fetch('/api/admin/logout', { method: 'POST', credentials: 'include' });
+      } catch (e) {}
       location.href = '/admin';
     }
   </script>

@@ -5,9 +5,9 @@ compatibility_date = "2024-01-01"
 # KV Namespace binding for storing maintenance configuration persistently
 # KV 생성 후 아래 주석을 해제하고 실제 ID로 변경하세요:
 # `npx wrangler kv:namespace create MAINTENANCE_KV`
-# [[kv_namespaces]]
-# binding = "MAINTENANCE_KV"
-# id = "YOUR_ACTUAL_KV_NAMESPACE_ID"
+[[kv_namespaces]]
+binding = "MAINTENANCE_KV"
+id = "ace4e37a0bfd4fa7b5e9f7934928d6d0"
 
 [vars]
 # Default admin key if env secret is not set (Production recommended: `npx wrangler secret put ADMIN_KEY`)
